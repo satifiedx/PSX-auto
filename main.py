@@ -15,7 +15,7 @@ import threading
 import core
 
 APP_NAME = "PSX Sample Forge"
-VERSION = "2.0"
+VERSION = "2.1"
 
 BG = "#1e1e1e"
 PANEL = "#252526"
@@ -34,6 +34,9 @@ DEFAULT_SETTINGS = {
     "loop_start_ms": 0.0,
     "crossfade_ms": 0.0,
     "normalize": False,
+    "declick": True,
+    "trim_silence": False,
+    "auto_loop": True,
     "export_wav": False,
     "out_dir": "",
 }
@@ -116,8 +119,8 @@ class PSXConverterApp:
         self.root.title(f"{APP_NAME} {VERSION}")
         # Window size in 96-DPI units, scaled for HiDPI screens
         scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
-        self.root.geometry(f"{int(560 * scale)}x{int(640 * scale)}")
-        self.root.minsize(int(520 * scale), int(600 * scale))
+        self.root.geometry(f"{int(560 * scale)}x{int(700 * scale)}")
+        self.root.minsize(int(520 * scale), int(660 * scale))
         self.root.configure(bg=BG)
 
         self.encoder = core.find_encoder()
@@ -125,6 +128,7 @@ class PSXConverterApp:
         self.files = []
         self.events = queue.Queue()
         self.worker = None
+        self.playing_job = None
         self.preview_path = os.path.join(tempfile.gettempdir(), "psxforge_preview.wav")
 
         self._setup_styles()
@@ -214,28 +218,38 @@ class PSXConverterApp:
         self.normalize_var = tk.BooleanVar(value=s["normalize"])
         ttk.Checkbutton(opts, text="Normalize", variable=self.normalize_var).grid(row=0, column=2, columnspan=2, sticky="w")
 
+        self.declick_var = tk.BooleanVar(value=s["declick"])
+        ttk.Checkbutton(opts, text="Declick (DC + edge fades)", variable=self.declick_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+        self.trim_var = tk.BooleanVar(value=s["trim_silence"])
+        ttk.Checkbutton(opts, text="Trim silence", variable=self.trim_var).grid(row=1, column=2, columnspan=2, sticky="w")
+
         self.loop_var = tk.BooleanVar(value=s["loop"])
         ttk.Checkbutton(opts, text="Loop mode (pads, leads, breaks)", variable=self.loop_var,
-                        command=self.update_loop_state).grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+                        command=self.update_loop_state).grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
         self.wav_var = tk.BooleanVar(value=s["export_wav"])
-        ttk.Checkbutton(opts, text="Also save PSX .wav", variable=self.wav_var).grid(row=1, column=2, columnspan=2, sticky="w")
+        ttk.Checkbutton(opts, text="Also save PSX .wav", variable=self.wav_var).grid(row=2, column=2, columnspan=2, sticky="w")
 
-        ttk.Label(opts, text="Loop start").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(opts, text="Loop start").grid(row=3, column=0, sticky="w", pady=3)
         self.loop_start_var = tk.StringVar(value=_fmt_num(s["loop_start_ms"]))
         cell = self._unit_cell(opts, "ms")
-        cell.grid(row=2, column=1, sticky="w", padx=8)
+        cell.grid(row=3, column=1, sticky="w", padx=8)
         self.loop_start_entry = ttk.Entry(cell, textvariable=self.loop_start_var, width=8)
         self.loop_start_entry.pack(side="left")
 
-        ttk.Label(opts, text="Crossfade").grid(row=2, column=2, sticky="w")
+        ttk.Label(opts, text="Crossfade").grid(row=3, column=2, sticky="w")
         self.xfade_var = tk.StringVar(value=_fmt_num(s["crossfade_ms"]))
         cell = self._unit_cell(opts, "ms")
-        cell.grid(row=2, column=3, sticky="w", padx=8)
+        cell.grid(row=3, column=3, sticky="w", padx=8)
         self.xfade_entry = ttk.Entry(cell, textvariable=self.xfade_var, width=8)
         self.xfade_entry.pack(side="left")
 
+        self.auto_loop_var = tk.BooleanVar(value=s["auto_loop"])
+        self.auto_loop_check = ttk.Checkbutton(opts, text="Auto loop point (find the smoothest loop end)",
+                                               variable=self.auto_loop_var)
+        self.auto_loop_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+
         self.info_label = ttk.Label(opts, text="", style="Muted.TLabel", justify="left")
-        self.info_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 4))
+        self.info_label.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 4))
 
         # Output folder
         out = tk.Frame(self.root, bg=BG)
@@ -284,9 +298,10 @@ class PSXConverterApp:
         state = ["!disabled"] if self.loop_var.get() else ["disabled"]
         self.loop_start_entry.state(state)
         self.xfade_entry.state(state)
+        self.auto_loop_check.state(state)
         if self.loop_var.get():
             self.info_label.config(text="Loop is aligned to 28-sample SPU blocks, so it repeats seamlessly on hardware.\n"
-                                        "Crossfade smooths clicks at the loop point (try 10-50 ms).")
+                                        "Auto loop point + crossfade (10-50 ms) kill clicks at the loop point.")
         else:
             self.info_label.config(text="One-shot: for kicks, snares, hats and SFX.\n ")
 
@@ -360,6 +375,9 @@ class PSXConverterApp:
         options = {
             "rate": rate,
             "normalize": self.normalize_var.get(),
+            "declick": self.declick_var.get(),
+            "trim_silence": self.trim_var.get(),
+            "auto_loop": self.auto_loop_var.get(),
             "loop": self.loop_var.get(),
             "loop_start_ms": loop_start,
             "crossfade_ms": xfade,
@@ -400,18 +418,22 @@ class PSXConverterApp:
 
     def _convert_worker(self, files, options):
         errors = []
+        total_bytes = 0
         for i, path in enumerate(files):
             self.events.put(("status", f"Converting {os.path.basename(path)}  ({i + 1}/{len(files)})", WARN))
             try:
-                core.convert_file(path, self.encoder, **options)
+                total_bytes += core.convert_file(path, self.encoder, **options)["bytes"]
             except Exception as e:
                 errors.append((path, str(e)))
             self.events.put(("progress", i + 1))
-        self.events.put(("done", len(files), errors, options["out_dir"] or os.path.dirname(files[0])))
+        self.events.put(("done", len(files), errors, options["out_dir"] or os.path.dirname(files[0]), total_bytes))
 
     def preview(self):
         """Encode the selected file with current settings, decode it back and play it."""
         from tkinter import messagebox
+        if self.playing_job:
+            self.stop_preview()
+            return
         if os.name != "nt" or (self.worker and self.worker.is_alive()):
             return
         if not self.files:
@@ -431,20 +453,24 @@ class PSXConverterApp:
         self.worker.start()
 
     def _preview_worker(self, path, options):
-        import soundfile as sf
         vag = self.preview_path[:-4] + ".vag"
+        prep = {k: v for k, v in options.items() if k not in ("export_wav", "out_dir")}
         try:
-            data, sr = sf.read(path, dtype="float32", always_2d=True)
-            samples, loop_start = core.prepare_audio(data, sr, options["rate"], options["normalize"], options["loop"],
-                                                     options["loop_start_ms"], options["crossfade_ms"])
+            data, sr = core.read_audio(path)
+            samples, loop_start = core.prepare_audio(data, sr, **prep)
             core.encode_vag(samples, options["rate"], vag, self.encoder, options["loop"], loop_start)
             decoded, rate, vag_loop = core.decode_vag(vag)
-            core.write_wav(self.preview_path, core.render_preview(decoded, vag_loop, rate), rate)
-            self.events.put(("play", os.path.basename(path)))
+            rendered = core.render_preview(decoded, vag_loop, rate)
+            core.write_wav(self.preview_path, rendered, rate)
+            self.events.put(("play", os.path.basename(path), len(rendered) / rate))
         except Exception as e:
             self.events.put(("error", str(e)))
 
     def stop_preview(self):
+        if self.playing_job:
+            self.root.after_cancel(self.playing_job)
+            self.playing_job = None
+        self.btn_preview.config(text="▶ Preview")
         if os.name == "nt":
             import winsound
             winsound.PlaySound(None, winsound.SND_PURGE)
@@ -464,19 +490,21 @@ class PSXConverterApp:
                     self.set_busy(False)
                     self.set_status(f"Playing PSX preview: {event[1]}", OK)
                     winsound.PlaySound(self.preview_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    self.btn_preview.config(text="■ Stop")
+                    self.playing_job = self.root.after(int(event[2] * 1000) + 200, self.stop_preview)
                 elif kind == "error":
                     self.set_busy(False)
                     self.set_status("Preview failed", ERR)
                     messagebox.showerror("Error", event[1])
                 elif kind == "done":
-                    _, total, errors, folder = event
+                    _, total, errors, folder, total_bytes = event
                     self.set_busy(False)
                     if errors:
                         self.set_status(f"Done with errors: {total - len(errors)}/{total} converted", ERR)
                         details = "\n\n".join(f"{os.path.basename(p)}:\n{msg}" for p, msg in errors[:10])
                         messagebox.showerror("Some files failed", details)
                     else:
-                        self.set_status(f"Done: {total} file{'s' if total != 1 else ''} → {folder}", OK)
+                        self.set_status(f"Done: {total} file{'s' if total != 1 else ''}, {spu_ram_text(total_bytes)} → {folder}", OK)
         except queue.Empty:
             pass
         self.root.after(50, self._poll_events)
@@ -489,6 +517,11 @@ class PSXConverterApp:
             except OSError:
                 pass
         self.root.destroy()
+
+
+def spu_ram_text(total_bytes):
+    """Batch size vs PS1 sound RAM."""
+    return f"{total_bytes / 1024:.1f} KB ({100 * total_bytes / core.SPU_RAM_BYTES:.0f}% of SPU RAM)"
 
 
 def _fmt_num(value):
@@ -518,17 +551,20 @@ def run_cli(args):
         print("psxavenc not found. Put it into bin/ or on PATH.", file=sys.stderr)
         return 1
     failed = 0
+    total_bytes = 0
     for path in files:
         try:
             info = core.convert_file(path, encoder, rate=args.rate, normalize=args.normalize, loop=args.loop,
                                      loop_start_ms=args.loop_start, crossfade_ms=args.xfade,
-                                     export_wav=args.wav, out_dir=args.output)
+                                     declick=not args.no_declick, trim_silence=args.trim,
+                                     auto_loop=not args.no_auto_loop, export_wav=args.wav, out_dir=args.output)
+            total_bytes += info["bytes"]
             loop = f", loop @ {info['loop_start']} smp" if info["loop_start"] is not None else ""
             print(f"OK   {path} -> {info['vag']} ({info['bytes']} bytes{loop})")
         except Exception as e:
             failed += 1
             print(f"FAIL {path}: {e}", file=sys.stderr)
-    print(f"{len(files) - failed}/{len(files)} converted.")
+    print(f"{len(files) - failed}/{len(files)} converted, {spu_ram_text(total_bytes)}.")
     return 1 if failed else 0
 
 
@@ -539,6 +575,9 @@ def parse_args(argv):
     p.add_argument("-l", "--loop", action="store_true", help="loop mode: block-aligned seamless loop")
     p.add_argument("--loop-start", type=float, default=0.0, metavar="MS", help="loop start in ms (default 0)")
     p.add_argument("--xfade", type=float, default=0.0, metavar="MS", help="loop crossfade in ms (default 0)")
+    p.add_argument("--no-auto-loop", action="store_true", help="keep the loop end as is (no smart search)")
+    p.add_argument("--no-declick", action="store_true", help="skip DC removal and edge fades")
+    p.add_argument("-t", "--trim", action="store_true", help="trim leading/trailing silence (one-shots)")
     p.add_argument("-n", "--normalize", action="store_true", help="peak normalize to -0.3 dBFS")
     p.add_argument("-w", "--wav", action="store_true", help="also save the decoded PSX sound as .psx.wav")
     p.add_argument("-o", "--output", metavar="DIR", help="output folder (default: next to source)")

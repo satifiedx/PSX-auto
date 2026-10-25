@@ -27,7 +27,11 @@ Built after the video [**«Как сделать звук как на насто
 * **PSX `.wav` export.** Decodes the `.vag` back exactly like the SPU does, so you can drop the crunched sound straight into FL Studio / Ableton / Reaper. No emulator needed.
 * **▶ Preview.** Hear the PS1 version before converting. Loops are previewed looping.
 * **Seamless loops.** Loop length and loop start are snapped to 28-sample SPU blocks, the loop flags are written with block precision.
-* **Loop crossfade.** Built-in equal-power crossfade kills clicks at the loop point.
+* **Auto loop point.** Searches block-aligned loop ends and picks the one that joins the loop start most smoothly.
+* **Loop crossfade.** Built-in equal-power crossfade for loops that still click.
+* **Declick.** Removes DC offset and adds micro fades to one-shot edges, so nothing pops when a sample starts or stops.
+* **Trim silence.** Cuts dead air at the start and end of one-shots.
+* **SPU RAM meter.** Shows how much of the PS1's 512 KB sound RAM your batch takes.
 * **Loop start point.** Keep the attack, loop only the sustain (classic sampler style).
 * **Batch.** Drag & drop files or whole folders onto the window (or onto the `.exe`).
 * **Any sample rate.** 44100 (SPU max) down to 8000 Hz for extra grit. 22050 by default.
@@ -39,7 +43,7 @@ Built after the video [**«Как сделать звук как на насто
 2. Drop your samples onto the window.
 3. Pick a mode:
    * **One-shot** (loop off): kicks, snares, hats, SFX.
-   * **Loop mode**: pads, leads, breaks, textures. Set **Crossfade** to 10-50 ms if the loop clicks.
+   * **Loop mode**: pads, leads, breaks, textures. **Auto loop point** is on by default, add **Crossfade** 10-50 ms if the loop still clicks.
 4. Tick **Also save PSX .wav** if you want the crunched sound in your DAW.
 5. Hit **CONVERT**. Files land next to the source (or in the folder you chose).
 
@@ -58,6 +62,9 @@ python main.py drums/ pad.flac --loop --xfade 20 --wav -r 22050 -o out/
 | `-l, --loop` | loop mode |
 | `--loop-start MS` | loop start point in ms |
 | `--xfade MS` | loop crossfade in ms |
+| `--no-auto-loop` | keep the loop end as is |
+| `--no-declick` | skip DC removal and edge fades |
+| `-t, --trim` | trim leading/trailing silence (one-shots) |
 | `-n, --normalize` | peak normalize to -0.3 dBFS |
 | `-w, --wav` | also save the decoded `.psx.wav` |
 | `-o, --output DIR` | output folder |
@@ -66,10 +73,12 @@ python main.py drums/ pad.flac --loop --xfade 20 --wav -r 22050 -o out/
 ### How it works
 1. Read audio, downmix to mono.
 2. Resample with [soxr](https://github.com/dofuuz/python-soxr) (VHQ). Unlike FFT resampling there is no ringing at the edges, so drum transients stay clean.
-3. Loop mode: snap the loop start to a 28-sample block, trim the end so the loop is a whole number of blocks, apply the crossfade.
-4. Encode with psxavenc, padding only to one 16-byte ADPCM block.
-5. Write the loop-start flag into the exact block and the sample name into the VAG header.
-6. Optional: decode SPU-ADPCM back to 16-bit WAV.
+3. Declick: remove DC offset, optionally trim silence and normalize.
+4. Loop mode: snap the loop start to a 28-sample block, trim the end to whole blocks, then test up to 64 earlier block-aligned ends and keep the one where the last samples best predict the first loop sample (value and slope). Apply the crossfade.
+5. One-shot: 1 ms fade-in, 5 ms fade-out (loops are never faded, that would dip on every repeat).
+6. Encode with psxavenc, padding only to one 16-byte ADPCM block.
+7. Write the loop-start flag into the exact block and the sample name into the VAG header.
+8. Optional: decode SPU-ADPCM back to 16-bit WAV.
 
 ---
 
@@ -80,7 +89,11 @@ python main.py drums/ pad.flac --loop --xfade 20 --wav -r 22050 -o out/
 * **Экспорт PSX `.wav`.** Декодирует `.vag` обратно так же, как это делает SPU. Хрустящий звук сразу кидаешь в FL Studio / Ableton, без эмулятора.
 * **▶ Предпрослушка.** Слушаешь PS1-версию до конвертации. Лупы играют зацикленно.
 * **Бесшовные лупы.** Длина и старт лупа выравниваются по блокам SPU (28 сэмплов), флаги лупа ставятся точно в нужный блок.
-* **Кроссфейд лупа.** Встроенный кроссфейд убирает щелчки на стыке.
+* **Авто точка лупа.** Перебирает концы лупа по границам блоков и выбирает тот, где стык самый гладкий.
+* **Кроссфейд лупа.** Встроенный кроссфейд, если луп всё равно щёлкает.
+* **Деклик.** Убирает DC-смещение и делает микрофейды на краях ваншотов, ничего не щёлкает на старте и в конце.
+* **Обрезка тишины.** Режет пустоту в начале и конце ваншотов.
+* **Счётчик SPU RAM.** Показывает, сколько из 512 KB звуковой памяти PS1 займёт пачка.
 * **Точка старта лупа.** Атака играет один раз, зацикливается только сустейн.
 * **Пачкой.** Перетаскивай файлы или целые папки в окно (или прямо на `.exe`).
 * **Любая частота.** От 44100 (максимум SPU) до 8000 Гц для лютого лоу-фая. По умолчанию 22050.
@@ -92,7 +105,7 @@ python main.py drums/ pad.flac --loop --xfade 20 --wav -r 22050 -o out/
 2. Перетащи сэмплы в окно.
 3. Выбери режим:
    * **One-shot** (луп выключен): бочки, снейры, хэты, эффекты.
-   * **Loop mode**: пэды, лиды, брейки, текстуры. Если луп щёлкает, поставь **Crossfade** 10-50 мс.
+   * **Loop mode**: пэды, лиды, брейки, текстуры. **Auto loop point** включён по умолчанию, если луп всё равно щёлкает, добавь **Crossfade** 10-50 мс.
 4. Поставь **Also save PSX .wav**, если нужен хрустящий звук для DAW.
 5. Жми **CONVERT**. Файлы появятся рядом с исходниками (или в выбранной папке).
 
